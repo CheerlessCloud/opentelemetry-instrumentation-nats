@@ -36,6 +36,10 @@ import { NatsInstrumentationConfig } from "./types";
 import * as utils from "./utils";
 import { VERSION } from "./version";
 
+type Message = Nats.Msg | Nats.JsMsg;
+type SubscriptionLike = Nats.Subscription | { [key: string]: unknown };
+type AsyncMessageIterator = AsyncIterableIterator<Message>;
+
 interface NatsHelpers {
   /** Tracks which subjects are reply addresses */
   replySubjects: Set<string>;
@@ -53,7 +57,16 @@ export class NatsInstrumentation extends InstrumentationBase<typeof Nats> {
     };
   }
 
-  _natsHelpers: NatsHelpers;
+  private readonly _natsHelpers: NatsHelpers;
+  private readonly _connectionWrappers = new WeakMap<
+    Nats.NatsConnection,
+    Map<PropertyKey, unknown>
+  >();
+  private readonly _jetStreamWrappers = new WeakMap<
+    object,
+    Map<PropertyKey, unknown>
+  >();
+  private readonly _messageContexts = new WeakMap<object, Context>();
 
   init(): InstrumentationNodeModuleDefinition<typeof Nats> {
     return new InstrumentationNodeModuleDefinition<typeof Nats>(
@@ -61,8 +74,7 @@ export class NatsInstrumentation extends InstrumentationBase<typeof Nats> {
       ["2.*"],
       (moduleExports, moduleVersion) => {
         diag.debug(`Applying nats patch for nats@${moduleVersion}`);
-        const { headers } = moduleExports;
-        // Grab helpers from nats moduleExports for wrappings in the future
+        const { headers } = moduleExports as typeof Nats;
         this._natsHelpers.headers = headers;
         this.ensureWrapped(
           moduleVersion,
@@ -82,166 +94,147 @@ export class NatsInstrumentation extends InstrumentationBase<typeof Nats> {
 
   private wrapConnect(originalFunc: typeof import("nats").connect) {
     const instrumentation = this;
-    const traps = {
-      get: function get(target: Nats.NatsConnection, prop: string) {
+    return async function connect(
+      this: unknown,
+      opts?: Nats.ConnectionOptions
+    ): Promise<Nats.NatsConnection> {
+      const nc = await originalFunc.call(this, opts);
+      return instrumentation.createInstrumentedConnection(nc);
+    };
+  }
+
+  private createInstrumentedConnection(
+    nc: Nats.NatsConnection
+  ): Nats.NatsConnection {
+    const instrumentation = this;
+    return new Proxy(nc, {
+      get(target, prop, receiver) {
         switch (prop) {
-          case "subscribe":
-            return instrumentation.wrapSubscribe(target.subscribe);
           case "publish":
-            return instrumentation.wrapPublish(target.publish);
+            return instrumentation.getConnectionWrapper(target, prop, () =>
+              instrumentation.createPublishWrapper(target, target.publish)
+            );
           case "request":
-            return instrumentation.wrapRequest(target.request);
+            return instrumentation.getConnectionWrapper(target, prop, () =>
+              instrumentation.createRequestWrapper(target, target.request)
+            );
+          case "subscribe":
+            return instrumentation.getConnectionWrapper(target, prop, () =>
+              instrumentation.createSubscribeWrapper(target, target.subscribe)
+            );
+          case "jetstream":
+            return instrumentation.getConnectionWrapper(target, prop, () => {
+              const original = target.jetstream;
+              if (typeof original !== "function") {
+                return original;
+              }
+              return function jetstream(this: Nats.NatsConnection, ...args: any[]) {
+                const jsClient = original.apply(this, args);
+                return instrumentation.wrapJetStream(target, jsClient);
+              };
+            });
           default:
-            return (target as any)[prop];
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof value === "function") {
+              return value.bind(target);
+            }
+            return value;
         }
       },
-    };
-    return async function connect(
-      opts?: Nats.ConnectionOptions | undefined
-    ): Promise<Nats.NatsConnection> {
-      const nc = await originalFunc(opts);
-      return new Proxy(nc, traps);
-    };
+    });
   }
 
-  private wrapSubscribe(originalFunc: Nats.NatsConnection["subscribe"]) {
+  private getConnectionWrapper<T>(
+    nc: Nats.NatsConnection,
+    prop: PropertyKey,
+    factory: () => T
+  ): T {
+    let cache = this._connectionWrappers.get(nc);
+    if (!cache) {
+      cache = new Map();
+      this._connectionWrappers.set(nc, cache);
+    }
+    if (!cache.has(prop)) {
+      cache.set(prop, factory());
+    }
+    return cache.get(prop) as T;
+  }
+
+  private getJetStreamWrapper<T>(
+    client: object,
+    prop: PropertyKey,
+    factory: () => T
+  ): T {
+    let cache = this._jetStreamWrappers.get(client);
+    if (!cache) {
+      cache = new Map();
+      this._jetStreamWrappers.set(client, cache);
+    }
+    if (!cache.has(prop)) {
+      cache.set(prop, factory());
+    }
+    return cache.get(prop) as T;
+  }
+
+  private createPublishWrapper(
+    nc: Nats.NatsConnection,
+    original: Nats.NatsConnection["publish"]
+  ) {
     const instrumentation = this;
-    return function subscribe(
+    return function publish(
       this: Nats.NatsConnection,
       subject: string,
-      opts?: Nats.SubscriptionOptions
-    ): Nats.Subscription {
-      const nc = this;
-      const genSpanAndContextFromMessage = (m: Nats.Msg): [Context, Span] => {
-        // Extract propagation info from nats header
-        const parentContext = propagation.extract(
-          ROOT_CONTEXT,
-          m.headers,
-          utils.natsContextGetter
-        );
-        const span = instrumentation.tracer.startSpan(
-          `${m.subject} process`,
-          {
-            attributes: {
-              ...utils.traceAttrs(nc.info, m),
-              [SemanticAttributes.MESSAGING_OPERATION]: "process",
-              [SemanticAttributes.MESSAGING_DESTINATION_KIND]: "topic",
-            },
-            // If the message has a reply address, assume it's seeking
-            // a response from us
-            kind: m.reply ? SpanKind.SERVER : SpanKind.CONSUMER,
-          },
-          parentContext
-        );
-        const ctx = trace.setSpan(parentContext, span);
-        return [ctx, span];
-      };
+      data?: Uint8Array,
+      options?: Nats.PublishOptions
+    ): void {
+      const publishOptions = options ? { ...options } : undefined;
+      const reply = publishOptions?.reply;
+      const { span, context: spanContext, headers } =
+        instrumentation.startProducerSpan(nc, subject, data, reply, publishOptions);
 
-      if (opts?.callback) {
-        const originalCallback = opts.callback;
-        opts.callback = function wrappedCallback(
-          err: Nats.NatsError | null,
-          msg: Nats.Msg
-        ) {
-          if (err) {
-            // If there was an error with Nats, bail early
-            originalCallback(err, msg);
-            return;
-          }
-
-          msg = instrumentation.setupMessage(msg, nc);
-          const [ctx, span] = genSpanAndContextFromMessage(msg);
-          try {
-            context.with(ctx, originalCallback, undefined, err, msg);
-            span.setStatus({
-              code: SpanStatusCode.OK,
-            });
-          } catch (err: any) {
-            span.setStatus({
-              code: SpanStatusCode.ERROR,
-              message: err.message,
-            });
-            span.recordException(err);
-            throw err;
-          } finally {
-            instrumentation.cleanupMessage(msg);
-            span.end();
-          }
-        };
+      try {
+        context.with(spanContext, () => {
+          const finalOptions = headers
+            ? { ...(publishOptions ?? {}), headers }
+            : publishOptions;
+          return original.call(this, subject, data, finalOptions);
+        });
+        span.setStatus({ code: SpanStatusCode.OK });
+      } catch (err) {
+        instrumentation.recordSpanError(span, err);
+        throw err;
+      } finally {
+        span.end();
       }
-      const sub = originalFunc.apply(this, [subject, opts]);
-      if (opts?.callback) {
-        // If we have a callback then sub is no longer an async iterator. No
-        // need to wrap it. Just bail early
-        // https://github.com/nats-io/nats.js#async-vs-callbacks
-        return sub;
-      }
-
-      const wrappedInterator = (async function* wrappedInterator() {
-        for await (let m of sub) {
-          m = instrumentation.setupMessage(m, nc);
-          // FixMe: Fix setting context once
-          // https://github.com/open-telemetry/opentelemetry-js-api/pull/123
-          // lands
-          const [_ctx, span] = genSpanAndContextFromMessage(m);
-
-          try {
-            yield m;
-            span.setStatus({
-              code: SpanStatusCode.OK,
-            });
-          } catch (err: any) {
-            span.setStatus({
-              code: SpanStatusCode.ERROR,
-              message: err.message,
-            });
-            span.recordException(err);
-            throw err;
-          } finally {
-            instrumentation.cleanupMessage(m);
-            span.end();
-          }
-        }
-      })();
-
-      Object.assign(wrappedInterator, sub);
-      return wrappedInterator as any;
     };
   }
 
-  private wrapRequest(originalFunc: Nats.NatsConnection["request"]) {
+  private createRequestWrapper(
+    nc: Nats.NatsConnection,
+    original: Nats.NatsConnection["request"]
+  ) {
     const instrumentation = this;
-
     return async function request(
       this: Nats.NatsConnection,
       subject: string,
       data?: Uint8Array,
       opts?: Nats.RequestOptions
     ): Promise<Nats.Msg> {
-      const nc = this;
-      // FixMe: "request" is a non-standard operation. Should we use a diffrent
-      // name/format for this span?
       const span = instrumentation.tracer.startSpan(`${subject} request`, {
         attributes: {
           ...utils.baseTraceAttrs(nc.info),
         },
         kind: SpanKind.CLIENT,
       });
-
+      const spanContext = trace.setSpan(context.active(), span);
       try {
-        const res = await context.with(
-          trace.setSpan(context.active(), span),
-          originalFunc,
-          this,
-          subject,
-          data,
-          opts
+        const res = await context.with(spanContext, () =>
+          original.call(this, subject, data, opts)
         );
         span.setStatus({ code: SpanStatusCode.OK });
         return res;
-      } catch (err: any) {
-        span.recordException(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      } catch (err) {
+        instrumentation.recordSpanError(span, err);
         throw err;
       } finally {
         span.end();
@@ -249,104 +242,524 @@ export class NatsInstrumentation extends InstrumentationBase<typeof Nats> {
     };
   }
 
-  private wrapPublish(originalFunc: Nats.NatsConnection["publish"]) {
+  private createSubscribeWrapper(
+    nc: Nats.NatsConnection,
+    original: Nats.NatsConnection["subscribe"]
+  ) {
     const instrumentation = this;
-    return function publish(
+    return function subscribe(
       this: Nats.NatsConnection,
       subject: string,
-      data: Uint8Array,
-      options?: Nats.PublishOptions
-    ): void {
-      const nc = this;
-      const isTemporaryDestination =
-        instrumentation.isTemporaryDestination(subject);
-      const destination = isTemporaryDestination ? "(temporary)" : subject;
-      const span = instrumentation.tracer.startSpan(`${destination} send`, {
-        attributes: {
-          ...utils.baseTraceAttrs(nc.info),
-          [SemanticAttributes.MESSAGING_DESTINATION_KIND]: "topic",
-          [SemanticAttributes.MESSAGING_DESTINATION]: destination,
-          [SemanticAttributes.MESSAGING_TEMP_DESTINATION]:
-            isTemporaryDestination,
-          [SemanticAttributes.MESSAGING_MESSAGE_PAYLOAD_SIZE_BYTES]: data
-            ? data.length
-            : 0,
-        },
-        kind: SpanKind.PRODUCER,
-      });
-      if (isTemporaryDestination) {
-        span.setAttribute(
-          SemanticAttributes.MESSAGING_CONVERSATION_ID,
-          subject
-        );
-      } else if (options?.reply) {
-        span.setAttribute(
-          SemanticAttributes.MESSAGING_CONVERSATION_ID,
-          options.reply
+      opts?: Nats.SubscriptionOptions
+    ): Nats.Subscription {
+      const subscribeOpts = opts ? { ...opts } : undefined;
+      if (subscribeOpts?.callback) {
+        subscribeOpts.callback = instrumentation.wrapSubscriptionCallback(
+          nc,
+          subscribeOpts.callback
         );
       }
-      const ctx = trace.setSpan(context.active(), span);
-      const h = options?.headers
-        ? options.headers
-        : instrumentation._natsHelpers.headers!();
-      propagation.inject(ctx, h, utils.natsContextSetter);
+      const sub = original.call(this, subject, subscribeOpts);
+      if (subscribeOpts?.callback) {
+        return sub;
+      }
+      return instrumentation.wrapSubscription(nc, sub);
+    };
+  }
 
+  private wrapSubscription(
+    nc: Nats.NatsConnection,
+    subscription: SubscriptionLike
+  ): SubscriptionLike {
+    if (!subscription || typeof subscription !== "object") {
+      return subscription;
+    }
+    const instrumentation = this;
+    return new Proxy(subscription as SubscriptionLike, {
+      get(target, prop, receiver) {
+        if (prop === Symbol.asyncIterator) {
+          return function (...args: unknown[]) {
+            const iterator = (target as any)[Symbol.asyncIterator](...args);
+            return instrumentation.wrapAsyncIterator(nc, iterator);
+          };
+        }
+        if (prop === "iterate") {
+          return function (...args: unknown[]) {
+            const iterator = (target as any).iterate(...args);
+            return instrumentation.wrapAsyncIterator(nc, iterator);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value === "function") {
+          return value.bind(target);
+        }
+        return value;
+      },
+    });
+  }
+
+  private wrapAsyncIterator(
+    nc: Nats.NatsConnection,
+    iterator: AsyncMessageIterator
+  ): AsyncMessageIterator {
+    const instrumentation = this;
+    const wrapped = (async function* (): AsyncMessageIterator {
+      for await (let msg of iterator) {
+        const { message, span } = instrumentation.prepareMessage(nc, msg);
+        try {
+          yield message;
+          span.setStatus({ code: SpanStatusCode.OK });
+        } catch (err) {
+          instrumentation.recordSpanError(span, err);
+          throw err;
+        } finally {
+          instrumentation.cleanupMessage(message);
+          span.end();
+        }
+      }
+    })();
+    return wrapped;
+  }
+
+  private wrapJetStream(
+    nc: Nats.NatsConnection,
+    client: Nats.JetStreamClient
+  ): Nats.JetStreamClient {
+    if (!client || typeof client !== "object") {
+      return client;
+    }
+    const instrumentation = this;
+    return new Proxy(client, {
+      get(target, prop, receiver) {
+        switch (prop) {
+          case "publish":
+            return instrumentation.getJetStreamWrapper(target, prop, () =>
+              instrumentation.createJetStreamPublishWrapper(
+                nc,
+                target.publish?.bind(target)
+              )
+            );
+          case "subscribe":
+            return instrumentation.getJetStreamWrapper(target, prop, () =>
+              instrumentation.createJetStreamSubscribeWrapper(
+                nc,
+                target.subscribe?.bind(target)
+              )
+            );
+          case "pullSubscribe":
+            return instrumentation.getJetStreamWrapper(target, prop, () =>
+              instrumentation.createJetStreamPullSubscribeWrapper(
+                nc,
+                target.pullSubscribe?.bind(target)
+              )
+            );
+          case "fetch":
+            return instrumentation.getJetStreamWrapper(target, prop, () =>
+              instrumentation.createJetStreamFetchWrapper(
+                nc,
+                target.fetch?.bind(target)
+              )
+            );
+          case "pull":
+            return instrumentation.getJetStreamWrapper(target, prop, () =>
+              instrumentation.createJetStreamPullWrapper(
+                nc,
+                target.pull?.bind(target)
+              )
+            );
+          default:
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof value === "function") {
+              return value.bind(target);
+            }
+            return value;
+        }
+      },
+    });
+  }
+
+  private createJetStreamPublishWrapper(
+    nc: Nats.NatsConnection,
+    original?: Nats.JetStreamClient["publish"]
+  ) {
+    if (!original) {
+      return undefined;
+    }
+    const instrumentation = this;
+    return async function publish(
+      this: Nats.JetStreamClient,
+      subject: string,
+      data?: Uint8Array,
+      options?: Partial<Nats.JetStreamPublishOptions>
+    ): Promise<Nats.PubAck> {
+      const publishOptions = options ? { ...options } : undefined;
+      const { span, context: spanContext, headers } =
+        instrumentation.startProducerSpan(nc, subject, data, undefined, publishOptions);
       try {
-        context.with(ctx, originalFunc, this, subject, data, {
-          ...options,
-          headers: h,
-        });
+        const result = await context.with(spanContext, () =>
+          original.call(this, subject, data, headers
+            ? { ...(publishOptions ?? {}), headers }
+            : publishOptions)
+        );
         span.setStatus({ code: SpanStatusCode.OK });
-      } catch (err: any) {
-        span.recordException(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        return result;
+      } catch (err) {
+        instrumentation.recordSpanError(span, err);
         throw err;
       } finally {
         span.end();
       }
     };
+  }
+
+  private createJetStreamSubscribeWrapper(
+    nc: Nats.NatsConnection,
+    original?: Nats.JetStreamClient["subscribe"]
+  ) {
+    if (!original) {
+      return undefined;
+    }
+    const instrumentation = this;
+    return async function subscribe(
+      this: Nats.JetStreamClient,
+      subject: string,
+      opts?: Nats.ConsumerOptsBuilder | Partial<Nats.ConsumerOpts>
+    ): Promise<Nats.JetStreamSubscription> {
+      instrumentation.wrapJetStreamCallbackOptions(nc, opts);
+      const subscription = await original.call(this, subject, opts);
+      return instrumentation.wrapSubscription(nc, subscription) as Nats.JetStreamSubscription;
+    };
+  }
+
+  private createJetStreamPullSubscribeWrapper(
+    nc: Nats.NatsConnection,
+    original?: Nats.JetStreamClient["pullSubscribe"]
+  ) {
+    if (!original) {
+      return undefined;
+    }
+    const instrumentation = this;
+    return async function pullSubscribe(
+      this: Nats.JetStreamClient,
+      subject: string,
+      opts: Nats.ConsumerOptsBuilder | Partial<Nats.ConsumerOpts>
+    ): Promise<Nats.JetStreamPullSubscription> {
+      instrumentation.wrapJetStreamCallbackOptions(nc, opts);
+      const subscription = await original.call(this, subject, opts);
+      return instrumentation.wrapSubscription(nc, subscription) as Nats.JetStreamPullSubscription;
+    };
+  }
+
+  private createJetStreamFetchWrapper(
+    nc: Nats.NatsConnection,
+    original?: Nats.JetStreamClient["fetch"]
+  ) {
+    if (!original) {
+      return undefined;
+    }
+    const instrumentation = this;
+    return function fetch(
+      this: Nats.JetStreamClient,
+      stream: string,
+      durable: string,
+      opts?: Partial<Nats.PullOptions>
+    ): AsyncMessageIterator {
+      const iterator = original.call(this, stream, durable, opts) as AsyncMessageIterator;
+      return instrumentation.wrapAsyncIterator(nc, iterator);
+    };
+  }
+
+  private createJetStreamPullWrapper(
+    nc: Nats.NatsConnection,
+    original?: Nats.JetStreamClient["pull"]
+  ) {
+    if (!original) {
+      return undefined;
+    }
+    const instrumentation = this;
+    return async function pull(
+      this: Nats.JetStreamClient,
+      stream: string,
+      durable: string
+    ): Promise<Nats.JsMsg> {
+      const { span, context: spanContext } = instrumentation.startProcessSpanForPull(
+        nc,
+        stream
+      );
+      try {
+        const msg = await context.with(spanContext, () =>
+          original.call(this, stream, durable)
+        );
+        span.setStatus({ code: SpanStatusCode.OK });
+        const { message } = instrumentation.prepareMessage(nc, msg);
+        // End the span immediately since pull retrieves a single message.
+        instrumentation.cleanupMessage(message);
+        span.end();
+        return message as Nats.JsMsg;
+      } catch (err) {
+        instrumentation.recordSpanError(span, err);
+        span.end();
+        throw err;
+      }
+    };
+  }
+
+  private wrapJetStreamCallbackOptions(
+    nc: Nats.NatsConnection,
+    opts?: Nats.ConsumerOptsBuilder | Partial<Nats.ConsumerOpts>
+  ) {
+    if (!opts || typeof opts !== "object") {
+      return;
+    }
+    const instrumentation = this;
+    const maybeWrap = (container: any) => {
+      if (typeof container.callbackFn === "function") {
+        container.callbackFn = instrumentation.wrapSubscriptionCallback(
+          nc,
+          container.callbackFn
+        );
+      }
+    };
+    if (typeof (opts as Nats.ConsumerOptsBuilder).getOpts === "function") {
+      const builder = opts as Nats.ConsumerOptsBuilder & {
+        callback?: (fn: Nats.JsMsgCallback) => void;
+        callbackFn?: Nats.JsMsgCallback;
+        __otel_wrapped_callback__?: boolean;
+      };
+      maybeWrap(builder);
+      if (!builder.__otel_wrapped_callback__ && typeof builder.callback === "function") {
+        const originalCallbackSetter = builder.callback;
+        builder.callback = function (fn: Nats.JsMsgCallback) {
+          return originalCallbackSetter.call(
+            this,
+            instrumentation.wrapSubscriptionCallback(nc, fn)
+          );
+        };
+        Object.defineProperty(builder, "__otel_wrapped_callback__", {
+          value: true,
+          configurable: false,
+          enumerable: false,
+          writable: false,
+        });
+      }
+      return;
+    }
+    maybeWrap(opts);
+  }
+
+  private wrapSubscriptionCallback<T extends Message>(
+    nc: Nats.NatsConnection,
+    callback: (err: Nats.NatsError | null, msg: T) => void
+  ) {
+    const instrumentation = this;
+    return function wrappedCallback(
+      this: unknown,
+      err: Nats.NatsError | null,
+      msg: T
+    ) {
+      if (err) {
+        callback.call(this, err, msg);
+        return;
+      }
+      const { message, span, context: messageContext } =
+        instrumentation.prepareMessage(nc, msg);
+      try {
+        context.with(messageContext, () => callback.call(this, null, message));
+        span.setStatus({ code: SpanStatusCode.OK });
+      } catch (error) {
+        instrumentation.recordSpanError(span, error);
+        throw error;
+      } finally {
+        instrumentation.cleanupMessage(message);
+        span.end();
+      }
+    };
+  }
+
+  private prepareMessage(
+    nc: Nats.NatsConnection,
+    msg: Message
+  ): { message: Message; span: Span; context: Context } {
+    const instrumentedMsg = this.setupMessage(msg, nc);
+    const { span, context: messageContext } = this.startProcessSpan(
+      nc,
+      instrumentedMsg
+    );
+    this._messageContexts.set(instrumentedMsg as object, messageContext);
+    return { message: instrumentedMsg, span, context: messageContext };
+  }
+
+  private startProcessSpan(
+    nc: Nats.NatsConnection,
+    msg: Message
+  ): { span: Span; context: Context } {
+    const carrier = msg.headers;
+    const parentContext = carrier
+      ? propagation.extract(ROOT_CONTEXT, carrier, utils.natsContextGetter)
+      : ROOT_CONTEXT;
+    const attributes = {
+      ...utils.traceAttrs(nc.info, msg),
+      [SemanticAttributes.MESSAGING_OPERATION]: "process",
+      [SemanticAttributes.MESSAGING_DESTINATION_KIND]: "topic",
+    };
+    const kind = msg.reply ? SpanKind.SERVER : SpanKind.CONSUMER;
+    const span = this.tracer.startSpan(`${msg.subject} process`, {
+      attributes,
+      kind,
+    }, parentContext);
+    const ctx = trace.setSpan(parentContext, span);
+    return { span, context: ctx };
+  }
+
+  private startProcessSpanForPull(
+    nc: Nats.NatsConnection,
+    stream: string
+  ): { span: Span; context: Context } {
+    const span = this.tracer.startSpan(`${stream} pull`, {
+      attributes: {
+        ...utils.baseTraceAttrs(nc.info),
+        [SemanticAttributes.MESSAGING_OPERATION]: "process",
+        [SemanticAttributes.MESSAGING_DESTINATION_KIND]: "topic",
+        [SemanticAttributes.MESSAGING_DESTINATION]: stream,
+      },
+      kind: SpanKind.CONSUMER,
+    });
+    const ctx = trace.setSpan(context.active(), span);
+    return { span, context: ctx };
+  }
+
+  private startProducerSpan(
+    nc: Nats.NatsConnection,
+    subject: string,
+    data?: Uint8Array,
+    reply?: string,
+    options?: { headers?: Nats.MsgHdrs }
+  ): { span: Span; context: Context; headers?: Nats.MsgHdrs } {
+    const isTemporaryDestination = this.isTemporaryDestination(subject);
+    const destination = isTemporaryDestination ? "(temporary)" : subject;
+    const span = this.tracer.startSpan(`${destination} send`, {
+      attributes: {
+        ...utils.baseTraceAttrs(nc.info),
+        [SemanticAttributes.MESSAGING_DESTINATION_KIND]: "topic",
+        [SemanticAttributes.MESSAGING_DESTINATION]: destination,
+        [SemanticAttributes.MESSAGING_TEMP_DESTINATION]: isTemporaryDestination,
+        [SemanticAttributes.MESSAGING_MESSAGE_PAYLOAD_SIZE_BYTES]: data
+          ? data.length
+          : 0,
+      },
+      kind: SpanKind.PRODUCER,
+    });
+    if (isTemporaryDestination) {
+      span.setAttribute(SemanticAttributes.MESSAGING_CONVERSATION_ID, subject);
+    } else if (reply) {
+      span.setAttribute(SemanticAttributes.MESSAGING_CONVERSATION_ID, reply);
+    }
+    const spanContext = trace.setSpan(context.active(), span);
+    const headers = options?.headers
+      ? options.headers
+      : this._natsHelpers.headers?.();
+    if (headers) {
+      propagation.inject(spanContext, headers, utils.natsContextSetter);
+    }
+    return { span, context: spanContext, headers };
+  }
+
+  private recordSpanError(span: Span, err: unknown) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    span.recordException(error);
+  }
+
+  private setupMessage(msg: Message, nc: Nats.NatsConnection): Message {
+    if (msg.reply) {
+      this._natsHelpers.replySubjects.add(msg.reply);
+    }
+    const instrumentation = this;
+    const handler: ProxyHandler<any> = {
+      get(target, prop, receiver) {
+        if (prop === "respond") {
+          const originalRespond = Reflect.get(target, prop, receiver);
+          if (typeof originalRespond !== "function") {
+            return originalRespond;
+          }
+          return instrumentation.wrapRespond(originalRespond, nc, receiver as Message);
+        }
+        if (prop === "msg") {
+          const raw = Reflect.get(target, prop, receiver);
+          if (raw && typeof raw === "object") {
+            const wrappedRaw = instrumentation.setupMessage(raw, nc);
+            const parentCtx = instrumentation._messageContexts.get(
+              receiver as object
+            );
+            if (parentCtx) {
+              instrumentation._messageContexts.set(wrappedRaw as object, parentCtx);
+            }
+            return wrappedRaw;
+          }
+          return raw;
+        }
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value === "function") {
+          return value.bind(target);
+        }
+        return value;
+      },
+    };
+
+    return new Proxy(msg as any, handler);
+  }
+
+  private cleanupMessage(msg: Message) {
+    if (msg.reply) {
+      this._natsHelpers.replySubjects.delete(msg.reply);
+    }
+    this._messageContexts.delete(msg as object);
   }
 
   private wrapRespond(
     originalFunc: Nats.Msg["respond"],
-    nc: Nats.NatsConnection
+    nc: Nats.NatsConnection,
+    proxyMsg: Message
   ) {
     const instrumentation = this;
     return function respond(
       this: Nats.Msg,
-      data?: Uint8Array | undefined,
-      options?: Nats.PublishOptions | undefined
-    ) {
-      const msg = this;
-      const destination = "(temporary)";
-      const span = instrumentation.tracer.startSpan(`${destination} send`, {
+      data?: Uint8Array,
+      options?: Nats.PublishOptions
+    ): boolean {
+      const msg = proxyMsg;
+      const replySubject = msg.reply || "(temporary)";
+      const span = instrumentation.tracer.startSpan(`${replySubject} send`, {
         attributes: {
           ...utils.baseTraceAttrs(nc.info),
           [SemanticAttributes.MESSAGING_DESTINATION_KIND]: "topic",
-          [SemanticAttributes.MESSAGING_DESTINATION]: destination,
+          [SemanticAttributes.MESSAGING_DESTINATION]: replySubject,
           [SemanticAttributes.MESSAGING_TEMP_DESTINATION]: true,
           [SemanticAttributes.MESSAGING_MESSAGE_PAYLOAD_SIZE_BYTES]: data
             ? data.length
             : 0,
-          [SemanticAttributes.MESSAGING_CONVERSATION_ID]: msg.reply,
+          [SemanticAttributes.MESSAGING_CONVERSATION_ID]: msg.reply || replySubject,
         },
         kind: SpanKind.PRODUCER,
       });
-      const ctx = trace.setSpan(context.active(), span);
-      const h = msg.headers
-        ? msg.headers
-        : instrumentation._natsHelpers.headers!();
-      propagation.inject(ctx, h, utils.natsContextSetter);
-
+      const parentContext =
+        instrumentation._messageContexts.get(msg as object) ?? context.active();
+      const spanContext = trace.setSpan(parentContext, span);
+      const headers = options?.headers
+        ? options.headers
+        : msg.headers ?? instrumentation._natsHelpers.headers?.();
+      const finalOptions = headers
+        ? { ...(options ?? {}), headers }
+        : options;
+      if (headers) {
+        propagation.inject(spanContext, headers, utils.natsContextSetter);
+      }
       try {
-        context.with(ctx, originalFunc, this, data, {
-          ...options,
-          headers: h,
-        });
-        span.setStatus({ code: SpanStatusCode.OK });
-      } catch (err: any) {
-        span.recordException(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        return context.with(spanContext, () =>
+          originalFunc.call(this, data, finalOptions)
+        );
+      } catch (err) {
+        instrumentation.recordSpanError(span, err);
         throw err;
       } finally {
         span.end();
@@ -356,33 +769,6 @@ export class NatsInstrumentation extends InstrumentationBase<typeof Nats> {
 
   private isTemporaryDestination(subject: string) {
     return this._natsHelpers.replySubjects.has(subject);
-  }
-
-  private setupMessage(msg: Nats.Msg, nc: Nats.NatsConnection): Nats.Msg {
-    const instrumentation = this;
-    if (msg.reply) {
-      // Add this reply subject to tracked list. When/if we then respond
-      // to this reply we will know this is a response rather than
-      // publishing to a presisted subject
-      this._natsHelpers.replySubjects.add(msg.reply);
-    }
-    const traps = {
-      get: function get(target: Nats.Msg, prop: string) {
-        if (prop === "respond") {
-          return instrumentation.wrapRespond(target.respond, nc);
-        }
-        return (target as any)[prop];
-      },
-    };
-
-    return new Proxy(msg, traps);
-  }
-
-  private cleanupMessage(msg: Nats.Msg) {
-    if (msg.reply) {
-      // Remove temp reply addresses from memory
-      this._natsHelpers.replySubjects.delete(msg.reply);
-    }
   }
 
   ensureWrapped(

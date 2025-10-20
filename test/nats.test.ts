@@ -263,9 +263,7 @@ describe("nats@2.x", () => {
     });
   });
 
-  // Fixme: Uncomment this test once async interators properly persist context
-  // when calling Msg#respond
-  describe.skip("#request and #respond (async interator)", () => {
+  describe("#request and #respond (async interator)", () => {
     it("creats connected spans for the request/response flow", async () => {
       const parentSpan = provider.getTracer("default").startSpan("test span");
       const res = await context.with(
@@ -314,6 +312,165 @@ describe("nats@2.x", () => {
           parentSpan: spans[2],
         },
       ]);
+    });
+  });
+
+  describe("JetStream", () => {
+    const streamPrefix = "JS_OTEL_TEST";
+
+    const ensureStream = async (
+      jsm: natsTypes.JetStreamManager,
+      stream: string,
+      subject: string
+    ) => {
+      try {
+        await jsm.streams.delete(stream);
+      } catch (err) {
+        // ignore if stream does not exist
+      }
+      await jsm.streams.add({
+        name: stream,
+        subjects: [subject],
+        retention: "limits",
+      });
+    };
+
+    it("records spans for JetStream callback subscription", async () => {
+      const js = nc.jetstream();
+      const jsm = await nc.jetstreamManager();
+      const stream = `${streamPrefix}_CB_${Date.now()}`;
+      const subject = `${stream}.subject`;
+      await ensureStream(jsm, stream, subject);
+
+      const opts = natsTypes.consumerOpts();
+      opts.durable(`${stream}_dur`);
+      opts.manualAck();
+
+      let resolve: () => void;
+      const received = new Promise<void>((r) => {
+        resolve = r;
+      });
+
+      opts.callback((err, msg) => {
+        assert.strictEqual(err, null);
+        assert.ok(msg, "JetStream message received");
+        msg!.ack();
+        resolve();
+      });
+
+      const sub = await js.subscribe(subject, opts);
+      await js.publish(subject, encoder.encode("payload"));
+
+      await received;
+      await sub.drain();
+      await jsm.streams.delete(stream);
+
+      const spans = [...getTestSpans()].sort(sortByStartTime);
+      const sendSpan = spans.find((span) => span.name === `${subject} send`);
+      const processSpan = spans.find(
+        (span) => span.name === `${subject} process`
+      );
+      assert.ok(sendSpan, "JetStream publish span recorded");
+      assert.ok(processSpan, "JetStream process span recorded");
+      assert.strictEqual(processSpan!.parentSpanId, sendSpan!.spanContext().spanId);
+    });
+
+    it("records spans for JetStream async iterator subscription", async () => {
+      const js = nc.jetstream();
+      const jsm = await nc.jetstreamManager();
+      const stream = `${streamPrefix}_ITER_${Date.now()}`;
+      const subject = `${stream}.subject`;
+      await ensureStream(jsm, stream, subject);
+
+      const opts = natsTypes.consumerOpts();
+      opts.durable(`${stream}_dur`);
+      opts.manualAck();
+      opts.deliverTo(natsTypes.createInbox());
+
+      const sub = await js.subscribe(subject, opts);
+      const iter = (async () => {
+        for await (const msg of sub) {
+          msg.ack();
+          break;
+        }
+      })();
+
+      await js.publish(subject, encoder.encode("payload"));
+      await iter;
+      await sub.drain();
+      await jsm.streams.delete(stream);
+
+      const spans = [...getTestSpans()].sort(sortByStartTime);
+      const sendSpan = spans.find((span) => span.name === `${subject} send`);
+      const processSpan = spans.find(
+        (span) => span.name === `${subject} process`
+      );
+      assert.ok(sendSpan, "JetStream publish span recorded");
+      assert.ok(processSpan, "JetStream process span recorded");
+    });
+
+    it("records spans for JetStream pull subscription", async () => {
+      const js = nc.jetstream();
+      const jsm = await nc.jetstreamManager();
+      const stream = `${streamPrefix}_PULL_${Date.now()}`;
+      const subject = `${stream}.subject`;
+      const durable = `${stream}_dur`;
+      await ensureStream(jsm, stream, subject);
+
+      const opts = natsTypes.consumerOpts();
+      opts.durable(durable);
+      opts.manualAck();
+
+      const sub = await js.pullSubscribe(subject, opts);
+      await js.publish(subject, encoder.encode("payload"));
+
+      await sub.pull({ batch: 1 });
+      const reader = (async () => {
+        for await (const msg of sub) {
+          msg.ack();
+          break;
+        }
+      })();
+      await reader;
+      await sub.drain();
+      await jsm.streams.delete(stream);
+
+      const spans = [...getTestSpans()].sort(sortByStartTime);
+      const pullSpan = spans.find((span) => span.name === `${stream} pull`);
+      const processSpan = spans.find(
+        (span) => span.name === `${subject} process`
+      );
+      assert.ok(pullSpan, "JetStream pull span recorded");
+      assert.ok(processSpan, "JetStream process span recorded");
+    });
+
+    it("records spans for JetStream fetch iterator", async () => {
+      const js = nc.jetstream();
+      const jsm = await nc.jetstreamManager();
+      const stream = `${streamPrefix}_FETCH_${Date.now()}`;
+      const subject = `${stream}.subject`;
+      const durable = `${stream}_dur`;
+      await ensureStream(jsm, stream, subject);
+      await jsm.consumers.add(stream, {
+        durable_name: durable,
+        ack_policy: natsTypes.AckPolicy.Explicit,
+      });
+
+      await js.publish(subject, encoder.encode("payload"));
+      const iterator = js.fetch(stream, durable, { batch: 1, expires: 1000 });
+      for await (const msg of iterator) {
+        msg.ack();
+        break;
+      }
+      await jsm.streams.delete(stream);
+
+      const spans = [...getTestSpans()].sort(sortByStartTime);
+      const sendSpan = spans.find((span) => span.name === `${subject} send`);
+      const processSpan = spans.find(
+        (span) => span.name === `${subject} process`
+      );
+      assert.ok(sendSpan, "JetStream publish span recorded");
+      assert.ok(processSpan, "JetStream process span recorded");
     });
   });
 });

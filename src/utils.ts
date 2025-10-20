@@ -16,7 +16,7 @@
 
 import { TextMapGetter, TextMapSetter } from '@opentelemetry/api';
 import { SemanticAttributes } from '@opentelemetry/semantic-conventions';
-import type { ServerInfo, Msg, MsgHdrs } from 'nats';
+import type { ServerInfo, Msg, MsgHdrs, JsMsg } from 'nats';
 
 export function baseTraceAttrs(info: ServerInfo | undefined) {
   const attributes = {
@@ -34,7 +34,7 @@ export function baseTraceAttrs(info: ServerInfo | undefined) {
   return attributes;
 }
 
-export function traceAttrs(info: ServerInfo | undefined, m: Msg) {
+export function traceAttrs(info: ServerInfo | undefined, m: Msg | JsMsg) {
   const attributes = {
     ...baseTraceAttrs(info),
     [SemanticAttributes.MESSAGING_DESTINATION]: m.subject,
@@ -45,6 +45,17 @@ export function traceAttrs(info: ServerInfo | undefined, m: Msg) {
 
   if (m.reply) {
     attributes[SemanticAttributes.MESSAGING_CONVERSATION_ID] = m.reply;
+  }
+
+  const jsInfo = (m as JsMsg).info;
+  if (jsInfo && typeof jsInfo === 'object') {
+    if (jsInfo.stream) {
+      (attributes as Record<string, unknown>)["messaging.nats.stream"] =
+        jsInfo.stream;
+    }
+    if (jsInfo.consumer) {
+      attributes[SemanticAttributes.MESSAGING_CONSUMER_ID] = jsInfo.consumer;
+    }
   }
 
   return attributes;
